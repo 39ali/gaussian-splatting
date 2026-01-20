@@ -30,45 +30,6 @@ struct GaussianCPU {
   float opacity;
 };
 
-struct SortEntity {
-  float depth;
-  uint32_t index;
-
-  // We want Back-to-Front, so further objects (larger depth) come first
-  bool operator>(const SortEntity &other) const { return depth > other.depth; }
-
-  bool operator<(const SortEntity &other) const { return depth < other.depth; }
-};
-
-std::vector<uint32_t> sortGaussians(const std::vector<GaussianGPU> &gaussians,
-                                    const glm::mat4 &viewMatrix) {
-  size_t count = gaussians.size();
-  std::vector<SortEntity> depthList(count);
-
-  for (uint32_t i = 0; i < count; ++i) {
-    // Transform the 3D mean into camera space
-    // We only care about the Z component
-    // ViewMatrix * vec4(pos, 1.0)
-    glm::vec4 viewPos = viewMatrix * glm::vec4(gaussians[i].mean, 1.0f);
-    depthList[i] = {viewPos.z, i};
-  }
-
-  // Sort Back-to-Front
-  // Use std::stable_sort if you want to avoid flickering for identical depths
-  std::sort(depthList.begin(), depthList.end(),
-            [](const SortEntity &a, const SortEntity &b) {
-              return a.depth < b.depth; // back → front
-            });
-
-  // Extract just the indices
-  std::vector<uint32_t> sortedIndices(count);
-  for (size_t i = 0; i < count; ++i) {
-    sortedIndices[i] = depthList[i].index;
-  }
-
-  return sortedIndices;
-}
-
 struct SceneData {
   glm::mat4 proj;
   glm::mat4 view;
@@ -131,7 +92,7 @@ inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 std::vector<GaussianCPU> loadGaussianPLY(const std::string &path) {
   std::ifstream file(path, std::ios::binary);
   if (!file)
-    throw std::runtime_error("Failed to open PLY");
+    throw std::runtime_error("Failed to open PLY: " + path);
 
   PlyHeader header = parsePlyHeader(file);
   if (!header.binary)
@@ -300,14 +261,6 @@ Renderer::Renderer(GLFWwindow *window, uint32_t width, uint32_t height,
 
   {
     wgpu::BufferDescriptor desc{};
-    desc.label = "sorted indices buffer";
-    desc.size = sizeof(uint32_t) * gpuGaussian.size();
-    desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
-    sortedIndicesBuffer = ctx.device.CreateBuffer(&desc);
-  }
-
-  {
-    wgpu::BufferDescriptor desc{};
     desc.label = "visibleIndexBuffer";
     desc.size = sizeof(uint32_t) * gaussianCount;
     desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
@@ -324,8 +277,13 @@ Renderer::Renderer(GLFWwindow *window, uint32_t width, uint32_t height,
     indirectBuffer = ctx.device.CreateBuffer(&indirectDesc);
   }
 
-  initRenderPipline();
   initCullPipeline();
+  //
+  initHistogramPipeline();
+  initPrefixScanPipeline();
+  initScatterPipeline();
+  //
+  initRenderPipline();
 }
 
 void Renderer::initRenderPipline() {
@@ -345,7 +303,7 @@ void Renderer::initRenderPipline() {
   entries[2].binding = 2;
   entries[2].visibility = wgpu::ShaderStage::Vertex;
   entries[2].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
-  entries[2].buffer.minBindingSize = sortedIndicesBuffer.GetSize();
+  entries[2].buffer.minBindingSize = visibleIndexBuffer.GetSize();
 
   wgpu::BindGroupLayoutDescriptor bglDesc{.entryCount = 3, .entries = entries};
   wgpu::BindGroupLayout bgl = ctx.device.CreateBindGroupLayout(&bglDesc);
@@ -362,9 +320,9 @@ void Renderer::initRenderPipline() {
   bgEntries[1].size = gaussianBuffer.GetSize(); // sizeof(SceneData);
                                                 //
   bgEntries[2].binding = 2;
-  bgEntries[2].buffer = sortedIndicesBuffer;
+  bgEntries[2].buffer = visibleIndexBuffer;
   bgEntries[2].offset = 0;
-  bgEntries[2].size = sortedIndicesBuffer.GetSize();
+  bgEntries[2].size = visibleIndexBuffer.GetSize();
 
   auto bgd = wgpu::BindGroupDescriptor{
       .layout = bgl, .entryCount = 3, .entries = bgEntries};
@@ -534,16 +492,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
   wgpu::ColorTargetState colorTarget = {};
   colorTarget.format = ctx.backbufferFormat;
-  // wgpu::BlendState blend = {
-  //     .color{.operation = wgpu::BlendOperation::Add,
-  //            .srcFactor = wgpu::BlendFactor::OneMinusDstAlpha,
-  //            .dstFactor = wgpu::BlendFactor::One},
-
-  //     .alpha = wgpu::BlendComponent{
-  //         .operation = wgpu::BlendOperation::Add,
-  //         .srcFactor = wgpu::BlendFactor::OneMinusDstAlpha,
-  //         .dstFactor = wgpu::BlendFactor::One,
-  //     }};
 
   wgpu::BlendState blend = {
       .color{.operation = wgpu::BlendOperation::Add,
@@ -579,7 +527,570 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   renderPipeline = ctx.device.CreateRenderPipeline(&rpDesc);
 }
 
+void Renderer::initHistogramPipeline() {
+
+  uint32_t numGroups = (gaussianCount + 255) / 256;
+  uint32_t WGSize = 256; // (workgroup size)
+  uint32_t tilesCount = (gaussianCount + WGSize - 1) / WGSize;
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "histogramBuffer";
+    desc.size = sizeof(uint32_t) * tilesCount * 256;
+    desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    histogramBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "histUniformBuffer";
+    desc.size = sizeof(uint32_t) * 2;
+    desc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    histUniformBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "keysOutBuffer";
+    desc.size = sizeof(uint32_t) * gaussianCount;
+    desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    keysOutBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "valsOutBuffer";
+    desc.size = sizeof(uint32_t) * gaussianCount;
+    desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    valsOutBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  wgpu::BindGroupLayoutEntry entries[] = {
+      {// keys
+       .binding = 0,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}},
+      {// histogram
+       .binding = 1,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Storage}},
+      {// params
+       .binding = 2,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Uniform}}};
+
+  auto ldesc = wgpu::BindGroupLayoutDescriptor{
+      .entryCount = 3,
+      .entries = entries,
+  };
+
+  auto layout = ctx.device.CreateBindGroupLayout(&ldesc);
+
+  std::array<wgpu::BindGroupEntry, 3> bgEntries = {};
+  {
+    bgEntries[0].binding = 0;
+    bgEntries[0].buffer = depthBuffer;
+    bgEntries[0].offset = 0;
+    bgEntries[0].size = depthBuffer.GetSize();
+  }
+
+  {
+    bgEntries[1].binding = 1;
+    bgEntries[1].buffer = histogramBuffer;
+    bgEntries[1].offset = 0;
+    bgEntries[1].size = histogramBuffer.GetSize();
+  }
+
+  {
+    bgEntries[2].binding = 2;
+    bgEntries[2].buffer = histUniformBuffer;
+    bgEntries[2].offset = 0;
+    bgEntries[2].size = histUniformBuffer.GetSize();
+  }
+
+  {
+    wgpu::BindGroupDescriptor bgDesc = {
+        .label = "histogramBindGroup",
+        .layout = layout,
+        .entryCount = bgEntries.size(),
+        .entries = bgEntries.data(),
+    };
+    histogramBindGroup1 = ctx.device.CreateBindGroup(&bgDesc);
+  }
+  {
+    {
+      bgEntries[0].binding = 0;
+      bgEntries[0].buffer = keysOutBuffer;
+      bgEntries[0].offset = 0;
+      bgEntries[0].size = keysOutBuffer.GetSize();
+    }
+    wgpu::BindGroupDescriptor bgDesc = {
+        .label = "histogramBindGroup",
+        .layout = layout,
+        .entryCount = bgEntries.size(),
+        .entries = bgEntries.data(),
+    };
+    histogramBindGroup2 = ctx.device.CreateBindGroup(&bgDesc);
+  }
+
+  const char *shaderWGSL = R"(
+
+@group(0) @binding(0) var<storage, read> keys :  array<u32>;
+@group(0) @binding(1) var<storage, read_write> hist :  array<u32>;
+@group(0) @binding(2) var<uniform> params : vec2<u32>; // (digitOffset, numWorkgroups)
+
+var<workgroup> localHist : array<atomic<u32>, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>,
+        @builtin(workgroup_id) wid : vec3<u32>) {
+
+  // clear local histogram
+  if (lid.x < 256u) {
+    atomicStore(&localHist[lid.x], 0u);
+  }
+  workgroupBarrier();
+
+  let idx = gid.x;
+  if (idx < arrayLength(&keys)) {
+    let digit = (keys[idx] >> params.x) & 0xFFu;
+    atomicAdd(&localHist[digit], 1u);
+  }
+  workgroupBarrier();
+
+  // write to global histogram
+  if (lid.x < 256u) {
+    let outIndex = wid.x * 256u + lid.x;
+    hist[outIndex] = atomicLoad(&localHist[lid.x]);
+  }
+}
+
+)";
+
+  wgpu::ShaderSourceWGSL wgslDesc{};
+  wgslDesc.code = shaderWGSL;
+  wgpu::ShaderModuleDescriptor shaderDesc = wgpu::ShaderModuleDescriptor{
+      .nextInChain = &wgslDesc, .label = "radix histogram"};
+  wgpu::ShaderModule shaderModule = ctx.device.CreateShaderModule(&shaderDesc);
+
+  wgpu::PipelineLayoutDescriptor pipelineLayoutDesc = {
+      .bindGroupLayoutCount = 1, .bindGroupLayouts = &layout};
+
+  wgpu::PipelineLayout pipelineLayout =
+      ctx.device.CreatePipelineLayout(&pipelineLayoutDesc);
+
+  wgpu::ComputePipelineDescriptor cpDesc = {
+
+      .label = "histogramPipeline",
+      .layout = pipelineLayout,
+      .compute =
+          {
+              .module = shaderModule,
+              .entryPoint = "main",
+          },
+
+  };
+
+  histogramPipeline = ctx.device.CreateComputePipeline(&cpDesc);
+}
+
+void Renderer::initPrefixScanPipeline() {
+
+  uint32_t numGroups = (gaussianCount + 255) / 256;
+  uint32_t WGSize = 256; // (workgroup size)
+  uint32_t tilesCount = (gaussianCount + WGSize - 1) / WGSize;
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "tileOffsetBuffer";
+    desc.size = sizeof(uint32_t) * tilesCount * 256;
+    desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    tileOffsetBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "globalOffsetBuffer";
+    desc.size = sizeof(uint32_t) * 256;
+    desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    globalOffsetBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "prefixUniformBuffer";
+    desc.size = sizeof(uint32_t) * 2,
+    desc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    prefixUniformBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  wgpu::BindGroupLayoutEntry entries[] = {
+      {// histogram
+       .binding = 0,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}},
+      {// globalOffset
+       .binding = 1,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Storage}},
+
+      {// tileOffset
+       .binding = 2,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Storage}},
+
+      {// params
+       .binding = 3,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Uniform}}};
+
+  auto ldesc = wgpu::BindGroupLayoutDescriptor{
+      .entryCount = 4,
+      .entries = entries,
+  };
+
+  auto layout = ctx.device.CreateBindGroupLayout(&ldesc);
+
+  std::array<wgpu::BindGroupEntry, 4> bgEntries = {};
+  {
+    bgEntries[0].binding = 0;
+    bgEntries[0].buffer = histogramBuffer;
+    bgEntries[0].offset = 0;
+    bgEntries[0].size = histogramBuffer.GetSize();
+  }
+
+  {
+    bgEntries[1].binding = 1;
+    bgEntries[1].buffer = globalOffsetBuffer;
+    bgEntries[1].offset = 0;
+    bgEntries[1].size = globalOffsetBuffer.GetSize();
+  }
+
+  {
+    bgEntries[2].binding = 2;
+    bgEntries[2].buffer = tileOffsetBuffer;
+    bgEntries[2].offset = 0;
+    bgEntries[2].size = tileOffsetBuffer.GetSize();
+  }
+
+  {
+    bgEntries[3].binding = 3;
+    bgEntries[3].buffer = prefixUniformBuffer;
+    bgEntries[3].offset = 0;
+    bgEntries[3].size = prefixUniformBuffer.GetSize();
+  }
+
+  wgpu::BindGroupDescriptor bgDesc = {
+      .label = "prefixBindGroup",
+      .layout = layout,
+      .entryCount = bgEntries.size(),
+      .entries = bgEntries.data(),
+  };
+  prefixBindGroup = ctx.device.CreateBindGroup(&bgDesc);
+
+  const char *shaderWGSL = R"(
+
+@group(0) @binding(0) var<storage, read> hist : array<u32>;
+@group(0) @binding(1) var<storage, read_write> globalOffset : array<u32>;
+@group(0) @binding(2) var<storage, read_write> tileOffset : array<u32>;
+@group(0) @binding(3) var<uniform> params : vec2<u32>; // (numWorkgroups, radix=256)
+
+var<workgroup> temp : array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
+  let d = lid.x;
+  let G = params.x;
+
+  // compute prefix per digit over workgroups
+  var sum : u32 = 0u;
+  for (var w: u32 = 0u; w < G; w = w + 1u) {
+    let val = hist[w * 256u + d];
+    tileOffset[w * 256u + d] = sum;
+    sum = sum + val;
+  }
+  temp[d] = sum;
+  workgroupBarrier();
+
+  // prefix across digits
+  var prefix : u32 = 0u;
+  for (var i: u32 = 0u; i < d; i = i + 1u) {
+    prefix = prefix + temp[i];
+  }
+  globalOffset[d] = prefix;
+}
+
+)";
+
+  wgpu::ShaderSourceWGSL wgslDesc{};
+  wgslDesc.code = shaderWGSL;
+  wgpu::ShaderModuleDescriptor shaderDesc = wgpu::ShaderModuleDescriptor{
+      .nextInChain = &wgslDesc, .label = "prefix shader"};
+  wgpu::ShaderModule shaderModule = ctx.device.CreateShaderModule(&shaderDesc);
+
+  wgpu::PipelineLayoutDescriptor pipelineLayoutDesc = {
+      .bindGroupLayoutCount = 1, .bindGroupLayouts = &layout};
+
+  wgpu::PipelineLayout pipelineLayout =
+      ctx.device.CreatePipelineLayout(&pipelineLayoutDesc);
+
+  wgpu::ComputePipelineDescriptor cpDesc = {
+
+      .label = "prefix Pipeline",
+      .layout = pipelineLayout,
+      .compute =
+          {
+              .module = shaderModule,
+              .entryPoint = "main",
+          },
+
+  };
+
+  prefixPipeline = ctx.device.CreateComputePipeline(&cpDesc);
+}
+
+void Renderer::initScatterPipeline() {
+
+  uint32_t numGroups = (gaussianCount + 255) / 256;
+  uint32_t WGSize = 256; // (workgroup size)
+  uint32_t tilesCount = (gaussianCount + WGSize - 1) / WGSize;
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "scatterUniformBuffer";
+    desc.size = sizeof(uint32_t) * 2;
+    desc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    scatterUniformBuffer = ctx.device.CreateBuffer(&desc);
+  }
+
+  wgpu::BindGroupLayoutEntry entries[] = {
+      {// keys
+       .binding = 0,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}},
+      {// vals
+       .binding = 1,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}},
+      {// outKeys
+       .binding = 2,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Storage}},
+      {// outVals
+       .binding = 3,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Storage}},
+
+      {// globalOff
+       .binding = 4,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}},
+      {// tileOff
+       .binding = 5,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}},
+      {// params
+       .binding = 6,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Uniform}}};
+
+  auto ldesc = wgpu::BindGroupLayoutDescriptor{
+      .entryCount = 7,
+      .entries = entries,
+  };
+
+  auto layout = ctx.device.CreateBindGroupLayout(&ldesc);
+
+  std::array<wgpu::BindGroupEntry, 7> bgEntries = {};
+  {
+    bgEntries[0].binding = 0;
+    bgEntries[0].buffer = depthBuffer;
+    bgEntries[0].offset = 0;
+    bgEntries[0].size = depthBuffer.GetSize();
+  }
+
+  {
+    bgEntries[1].binding = 1;
+    bgEntries[1].buffer = visibleIndexBuffer;
+    bgEntries[1].offset = 0;
+    bgEntries[1].size = visibleIndexBuffer.GetSize();
+  }
+
+  {
+    bgEntries[2].binding = 2;
+    bgEntries[2].buffer = keysOutBuffer;
+    bgEntries[2].offset = 0;
+    bgEntries[2].size = keysOutBuffer.GetSize();
+  }
+
+  {
+    bgEntries[3].binding = 3;
+    bgEntries[3].buffer = valsOutBuffer;
+    bgEntries[3].offset = 0;
+    bgEntries[3].size = valsOutBuffer.GetSize();
+  }
+
+  {
+    bgEntries[4].binding = 4;
+    bgEntries[4].buffer = globalOffsetBuffer;
+    bgEntries[4].offset = 0;
+    bgEntries[4].size = globalOffsetBuffer.GetSize();
+  }
+
+  {
+    bgEntries[5].binding = 5;
+    bgEntries[5].buffer = tileOffsetBuffer;
+    bgEntries[5].offset = 0;
+    bgEntries[5].size = tileOffsetBuffer.GetSize();
+  }
+
+  {
+    bgEntries[6].binding = 6;
+    bgEntries[6].buffer = scatterUniformBuffer;
+    bgEntries[6].offset = 0;
+    bgEntries[6].size = scatterUniformBuffer.GetSize();
+  }
+
+  {
+    wgpu::BindGroupDescriptor bgDesc = {
+        .label = "scatterBindGroup",
+        .layout = layout,
+        .entryCount = bgEntries.size(),
+        .entries = bgEntries.data(),
+    };
+    scatterBindGroup1 = ctx.device.CreateBindGroup(&bgDesc);
+  }
+
+  {
+    {
+      bgEntries[0].binding = 0;
+      bgEntries[0].buffer = keysOutBuffer;
+      bgEntries[0].offset = 0;
+      bgEntries[0].size = keysOutBuffer.GetSize();
+    }
+
+    {
+      bgEntries[1].binding = 1;
+      bgEntries[1].buffer = valsOutBuffer;
+      bgEntries[1].offset = 0;
+      bgEntries[1].size = valsOutBuffer.GetSize();
+    }
+    {
+      bgEntries[2].binding = 2;
+      bgEntries[2].buffer = depthBuffer;
+      bgEntries[2].offset = 0;
+      bgEntries[2].size = depthBuffer.GetSize();
+    }
+
+    {
+      bgEntries[3].binding = 3;
+      bgEntries[3].buffer = visibleIndexBuffer;
+      bgEntries[3].offset = 0;
+      bgEntries[3].size = visibleIndexBuffer.GetSize();
+    }
+
+    wgpu::BindGroupDescriptor bgDesc = {
+        .label = "scatterBindGroup",
+        .layout = layout,
+        .entryCount = bgEntries.size(),
+        .entries = bgEntries.data(),
+    };
+    scatterBindGroup2 = ctx.device.CreateBindGroup(&bgDesc);
+  }
+
+  const char *shaderWGSL = R"(
+
+@group(0) @binding(0) var<storage, read> keys : array<u32>;
+@group(0) @binding(1) var<storage, read> vals : array<u32>;
+@group(0) @binding(2) var<storage, read_write> outKeys : array<u32>;
+@group(0) @binding(3) var<storage, read_write> outVals : array<u32>;
+
+@group(0) @binding(4) var<storage, read> globalOff : array<u32>;
+@group(0) @binding(5) var<storage, read> tileOff : array<u32>;
+@group(0) @binding(6) var<uniform> params : vec2<u32>; // (digitOffset, numWorkgroups)
+
+var<workgroup> digit : array<u32, 256>;
+var<workgroup> digitCount : array<atomic<u32>, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>,
+        @builtin(workgroup_id) wid : vec3<u32>) {
+
+
+  let idx = gid.x;
+  let valid = idx < arrayLength(&keys);
+
+  if (lid.x < 256u) {
+    atomicStore(&digitCount[lid.x], 0u);
+  }
+  workgroupBarrier();
+
+  var d : u32 = 0u;
+  if (valid) {
+    d = (keys[idx] >> params.x) & 0xFFu;
+  }
+
+ 
+  var rank : u32 = 0u;
+  if (valid) {
+    rank = atomicAdd(&digitCount[d], 1u);
+  }
+  workgroupBarrier();
+
+  // scatter 
+  if (valid) {
+    let outIndex =
+      globalOff[d] +
+      tileOff[wid.x * 256u + d] +
+      rank;
+
+    outKeys[outIndex] = keys[idx];
+    outVals[outIndex] = vals[idx];
+  }
+
+}
+
+
+)";
+
+  wgpu::ShaderSourceWGSL wgslDesc{};
+  wgslDesc.code = shaderWGSL;
+  wgpu::ShaderModuleDescriptor shaderDesc = wgpu::ShaderModuleDescriptor{
+      .nextInChain = &wgslDesc, .label = "scatter shader"};
+  wgpu::ShaderModule shaderModule = ctx.device.CreateShaderModule(&shaderDesc);
+
+  wgpu::PipelineLayoutDescriptor pipelineLayoutDesc = {
+      .bindGroupLayoutCount = 1, .bindGroupLayouts = &layout};
+
+  wgpu::PipelineLayout pipelineLayout =
+      ctx.device.CreatePipelineLayout(&pipelineLayoutDesc);
+
+  wgpu::ComputePipelineDescriptor cpDesc = {
+
+      .label = "scatterPipeline",
+      .layout = pipelineLayout,
+      .compute =
+          {
+              .module = shaderModule,
+              .entryPoint = "main",
+          },
+
+  };
+
+  scatterPipeline = ctx.device.CreateComputePipeline(&cpDesc);
+}
+
 void Renderer::initCullPipeline() {
+
+  {
+    wgpu::BufferDescriptor desc{};
+    desc.label = "depth buffer";
+    desc.size = sizeof(uint32_t) * gaussianCount;
+    desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    depthBuffer = ctx.device.CreateBuffer(&desc);
+  }
 
   wgpu::BindGroupLayoutEntry entries[] = {
       {// Scene uniform
@@ -597,16 +1108,20 @@ void Renderer::initCullPipeline() {
       {// indirectBuffer
        .binding = 3,
        .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::Storage}},
+      {// depth Buffer
+       .binding = 4,
+       .visibility = wgpu::ShaderStage::Compute,
        .buffer = {.type = wgpu::BufferBindingType::Storage}}};
 
   auto ldesc = wgpu::BindGroupLayoutDescriptor{
-      .entryCount = 4,
+      .entryCount = 5,
       .entries = entries,
   };
 
   auto layout = ctx.device.CreateBindGroupLayout(&ldesc);
 
-  std::array<wgpu::BindGroupEntry, 4> bgEntries = {};
+  std::array<wgpu::BindGroupEntry, 5> bgEntries = {};
   {
 
     bgEntries[0].binding = 0;
@@ -636,6 +1151,13 @@ void Renderer::initCullPipeline() {
     bgEntries[3].size = indirectBuffer.GetSize();
   }
 
+  {
+    bgEntries[4].binding = 4;
+    bgEntries[4].buffer = depthBuffer;
+    bgEntries[4].offset = 0;
+    bgEntries[4].size = depthBuffer.GetSize();
+  }
+
   wgpu::BindGroupDescriptor bgDesc = {
       .label = "cull bindinggroup",
       .layout = layout,
@@ -649,9 +1171,7 @@ void Renderer::initCullPipeline() {
    struct SceneData {
     proj: mat4x4<f32>,
     view: mat4x4<f32>,
-    inverseViewProj: mat4x4<f32>,
-    cameraPos: vec3<f32>,
-    time: f32,
+    viewport: vec4<f32>,
 };
 
 struct Gaussian {
@@ -679,6 +1199,7 @@ struct DrawIndirectArgs {
 @group(0) @binding(1) var<storage, read> gaussians : array<Gaussian>;
 @group(0) @binding(2) var<storage, read_write> visibleIndices : array<u32>;
 @group(0) @binding(3) var<storage, read_write> drawArgs : DrawIndirectArgs;
+@group(0) @binding(4) var<storage, read_write> depths : array<u32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id : vec3<u32>) {
@@ -690,11 +1211,12 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
         return;
     }
 
-    // let g = gaussians[i];
+     let g = gaussians[i];
 
     // // World → view → clip
-    // let worldPos = vec4<f32>(g.mean, 1.0);
-    // let viewPos  = scene.view * worldPos;
+    let worldPos = vec4<f32>(g.mean, 1.0);
+    let viewPos  = scene.view * worldPos;
+
     // let clipPos  = scene.proj * viewPos;
 
     // // Behind camera
@@ -722,6 +1244,12 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     // Survived → append index
     let writeIndex =atomicAdd(&drawArgs.instanceCount, 1u);
     visibleIndices[writeIndex] = i;
+
+    // write depth 
+    let depthBits : u32 = bitcast<u32>(viewPos.z);
+    let sign      : u32 = depthBits & 0x80000000u;
+
+    depths[writeIndex] = select(depthBits ^ 0x80000000u,~depthBits,sign != 0u);
 }
 
 )";
@@ -751,9 +1279,6 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
   };
 
   cullingPipeline = ctx.device.CreateComputePipeline(&cpDesc);
-
-  // cpDesc.compute.entryPoint = "details_main";
-  // detailNoisePipeline = ctx.device.CreateComputePipeline(&cpDesc);
 }
 
 void Renderer::render(const FlyCamera &camera, float time) {
@@ -763,50 +1288,139 @@ void Renderer::render(const FlyCamera &camera, float time) {
   scene.proj = camera.getProjectionMatrix();
   glm::mat4 flipScale =
       glm::scale(glm::mat4(1.0f), glm::vec3(-1.0f, -1.0f, 1.0f));
-
   scene.view = camera.getViewMatrix() * flipScale;
   scene.viewport = glm::vec4(ctx.width, ctx.height, 0.0, 0.0);
-  // Send to GPU
   ctx.queue.WriteBuffer(sceneBuffer, 0, &scene, sizeof(SceneData));
 
-  // {
-  //   std::vector<uint32_t> zeros(gaussianCount, 0);
-  //   ctx.queue.WriteBuffer(visibleIndexBuffer, 0, zeros.data(),
-  //                         gaussianCount * sizeof(uint32_t));
-  // }
-
-  // {
-  //   uint32_t zero[] = {4, 0, 0, 0};
-  //   ctx.queue.WriteBuffer(indirectBuffer, 0, zero, 4 * sizeof(uint32_t));
-  // }
+  {
+    std::vector<uint32_t> zeros(gaussianCount, 0);
+    ctx.queue.WriteBuffer(visibleIndexBuffer, 0, zeros.data(),
+                          gaussianCount * sizeof(uint32_t));
+  }
 
   {
-    auto start = std::chrono::high_resolution_clock::now();
-    auto sortedIndices = sortGaussians(gpuGaussian, scene.view);
-    ctx.queue.WriteBuffer(sortedIndicesBuffer, 0, sortedIndices.data(),
-                          sizeof(uint32_t) * sortedIndices.size());
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-    std::cout << "Average time: " << duration.count() << " microseconds\n";
+    uint32_t zero[] = {4, 0, 0, 0};
+    ctx.queue.WriteBuffer(indirectBuffer, 0, zero, 4 * sizeof(uint32_t));
   }
+
+  // {
+  //   auto start = std::chrono::high_resolution_clock::now();
+  //   auto sortedIndices = sortGaussians(gpuGaussian, scene.view);
+  //   ctx.queue.WriteBuffer(sortedIndicesBuffer, 0, sortedIndices.data(),
+  //                         sizeof(uint32_t) * sortedIndices.size());
+
+  //   auto end = std::chrono::high_resolution_clock::now();
+  //   auto duration =
+  //       std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+  //   std::cout << "Average time: " << duration.count() << " microseconds\n";
+  // }
 
   wgpu::SurfaceTexture surfaceTexture;
   ctx.surface.GetCurrentTexture(&surfaceTexture);
   wgpu::TextureView view = surfaceTexture.texture.CreateView();
 
   wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
-  // {
 
-  //   wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-  //   pass.SetPipeline(cullingPipeline);
-  //   pass.SetBindGroup(0, cullingBindGroup);
-  //   uint32_t groups = (gaussianCount + 255) / 256;
-  //   pass.DispatchWorkgroups(groups);
-  //   pass.End();
-  // }
+  // cull and write depth buffer
+  {
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+
+    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+    pass.SetPipeline(cullingPipeline);
+    pass.SetBindGroup(0, cullingBindGroup);
+    uint32_t groups = (gaussianCount + 255) / 256;
+    pass.DispatchWorkgroups(groups);
+    pass.End();
+
+    wgpu::CommandBuffer cmd = encoder.Finish();
+    ctx.queue.Submit(1, &cmd);
+  }
+
+  // sort
+  {
+
+    const uint32_t tiles = (gaussianCount + 255) / 256;
+    // const uint32_t maxDispatch = 65535;
+
+    for (uint32_t pass = 0; pass < 4; ++pass) {
+      const uint32_t digitOffset = pass * 8;
+
+      // ------------------------------------------------
+      // Update uniforms
+      // ------------------------------------------------
+
+      struct HistParams {
+        uint32_t digitOffset;
+        uint32_t numWorkgroups;
+      } histParams = {digitOffset, tiles};
+
+      ctx.queue.WriteBuffer(histUniformBuffer, 0, &histParams,
+                            sizeof(histParams));
+
+      struct PrefixParams {
+        uint32_t numWorkgroups;
+        uint32_t radix;
+      } prefixParams = {tiles, 256};
+
+      ctx.queue.WriteBuffer(prefixUniformBuffer, 0, &prefixParams,
+                            sizeof(prefixParams));
+
+      struct ScatterParams {
+        uint32_t digitOffset;
+        uint32_t numWorkgroups;
+      } scatterParams = {digitOffset, tiles};
+
+      ctx.queue.WriteBuffer(scatterUniformBuffer, 0, &scatterParams,
+                            sizeof(scatterParams));
+
+      // ------------------------------------------------
+      // Encode commands
+      // ------------------------------------------------
+
+      wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+
+      encoder.ClearBuffer(histogramBuffer, 0, histogramBuffer.GetSize());
+      encoder.ClearBuffer(globalOffsetBuffer, 0, globalOffsetBuffer.GetSize());
+      encoder.ClearBuffer(tileOffsetBuffer, 0, tileOffsetBuffer.GetSize());
+
+      {
+        wgpu::ComputePassDescriptor passDesc{};
+        wgpu::ComputePassEncoder cpass = encoder.BeginComputePass(&passDesc);
+
+        // ---------- Dispatch 1: Histogram ----------
+        cpass.SetPipeline(histogramPipeline);
+        if (pass % 2 == 0) {
+          cpass.SetBindGroup(0, histogramBindGroup1);
+        } else {
+          cpass.SetBindGroup(0, histogramBindGroup2);
+        }
+        cpass.DispatchWorkgroups(tiles, 1, 1);
+
+        // ---------- Dispatch 2: Prefix ----------
+        cpass.SetPipeline(prefixPipeline);
+        cpass.SetBindGroup(0, prefixBindGroup);
+        cpass.DispatchWorkgroups(1, 1, 1);
+
+        // ---------- Dispatch 3: Scatter ----------
+        cpass.SetPipeline(scatterPipeline);
+        if (pass % 2 == 0) {
+          cpass.SetBindGroup(0, scatterBindGroup1);
+        } else {
+          cpass.SetBindGroup(0, scatterBindGroup2);
+        }
+        cpass.DispatchWorkgroups(tiles, 1, 1);
+
+        cpass.End();
+      }
+
+      // Submit
+      wgpu::CommandBuffer cmd = encoder.Finish();
+      ctx.queue.Submit(1, &cmd);
+    }
+  }
+
+  // render
   {
     wgpu::RenderPassColorAttachment colorAttachment{
         .view = view,
@@ -829,8 +1443,8 @@ void Renderer::render(const FlyCamera &camera, float time) {
     wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDesc);
     pass.SetPipeline(renderPipeline);
     pass.SetBindGroup(0, renderBindGroup);
-    // pass.DrawIndirect(indirectBuffer, 0);
-    pass.Draw(4, gaussianCount);
+    pass.DrawIndirect(indirectBuffer, 0);
+    // pass.Draw(4, gaussianCount);
     pass.End();
   }
 

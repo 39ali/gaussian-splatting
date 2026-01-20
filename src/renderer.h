@@ -25,8 +25,12 @@ public:
   void initGui(GLFWwindow *window);
   void renderGui(wgpu::CommandEncoder &encoder, wgpu::TextureView &view);
 
-  void initRenderPipline();
   void initCullPipeline();
+  void initRenderPipline();
+  void initHistogramPipeline();
+  void initPrefixScanPipeline();
+  void initScatterPipeline();
+  // void sort();
 
 private:
 private:
@@ -40,16 +44,37 @@ private:
 
   std::vector<GaussianGPU> gpuGaussian;
   wgpu::Buffer gaussianBuffer;
-  wgpu::Buffer sortedIndicesBuffer;
-
-  wgpu::Buffer visibleIndexBuffer;
-  wgpu::Buffer indirectBuffer;
 
   wgpu::RenderPipeline renderPipeline;
   wgpu::BindGroup renderBindGroup;
 
   wgpu::ComputePipeline cullingPipeline;
   wgpu::BindGroup cullingBindGroup;
+  wgpu::Buffer visibleIndexBuffer;
+  wgpu::Buffer indirectBuffer;
+  wgpu::Buffer depthBuffer;
+
+  // radix sort onesweep
+  wgpu::ComputePipeline histogramPipeline;
+  wgpu::BindGroup histogramBindGroup1;
+  wgpu::BindGroup histogramBindGroup2;
+  wgpu::Buffer histogramBuffer;
+  wgpu::Buffer histUniformBuffer;
+  //
+  wgpu::ComputePipeline prefixPipeline;
+  wgpu::BindGroup prefixBindGroup;
+  wgpu::Buffer globalOffsetBuffer;
+  wgpu::Buffer tileOffsetBuffer;
+  wgpu::Buffer prefixUniformBuffer;
+  //
+  wgpu::ComputePipeline scatterPipeline;
+  wgpu::BindGroup scatterBindGroup1;
+  wgpu::BindGroup scatterBindGroup2;
+  wgpu::Buffer keysOutBuffer;
+  wgpu::Buffer valsOutBuffer;
+  wgpu::Buffer scatterUniformBuffer;
+
+  //
 
   uint32_t gaussianCount;
 };

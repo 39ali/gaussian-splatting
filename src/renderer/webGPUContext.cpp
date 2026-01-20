@@ -46,6 +46,7 @@ WebGPUContext::WebGPUContext(GLFWwindow *windowHandle, uint32_t width,
     std::cout << "Error: " << errorType << " - message: " << message << "\n";
   });
 
+#ifndef EMSCRIPTEN
   const char *const enabledToggles[] = {
       "use_user_defined_labels_in_backend",
   };
@@ -53,6 +54,7 @@ WebGPUContext::WebGPUContext(GLFWwindow *windowHandle, uint32_t width,
   deviceTogglesDesc.enabledToggles = enabledToggles;
   deviceTogglesDesc.enabledToggleCount = 1;
   desc.nextInChain = &deviceTogglesDesc;
+#endif
 
   wgpu::Future f2 = adapter.RequestDevice(
       &desc, wgpu::CallbackMode::WaitAnyOnly,
