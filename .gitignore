@@ -5,3 +5,4 @@ build-web/*
 !build-web/index.html
 
 *.ply
+.DS_Store

@@ -19,6 +19,7 @@ file(GLOB_RECURSE SRC
 # --------------------------------------------------
  add_executable(app_native ${SRC})
 
+
  if (NOT EMSCRIPTEN)
     # ---------- GLFW ----------
     set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -61,7 +62,7 @@ if (EMSCRIPTEN)
     target_link_options(app_native PRIVATE -sEXPORTED_RUNTIME_METHODS=['specialHTMLTargets'] -sEXPORT_ES6 -sMODULARIZE=1  -sINVOKE_RUN=0 -sNO_EXIT_RUNTIME=1 -sDISABLE_EXCEPTION_CATCHING=0  "-sALLOW_MEMORY_GROWTH=1" "-sASYNCIFY=1" --use-port=contrib.glfw3 )
     
     # input is relative to the build directory
-    target_link_options(app_native PRIVATE --preload-file ${CMAKE_CURRENT_SOURCE_DIR}/train_iteration_7000.ply@/train_iteration_7000.ply)
+    target_link_options(app_native PRIVATE --preload-file ${CMAKE_CURRENT_SOURCE_DIR}/assets@/assets)
 else()
 
     target_link_libraries(app_native PRIVATE
@@ -74,3 +75,12 @@ endif()
 
 
 target_link_libraries(app_native PRIVATE webgpu_glfw glm)
+
+
+
+## splat exporter 
+ add_executable(splat_exporter
+    exporter/main.cpp
+)
+
+target_link_libraries(splat_exporter PRIVATE glm)

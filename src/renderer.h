@@ -1,15 +1,10 @@
 #pragma once
 #define GLFW_INCLUDE_NONE
+#include "../exporter/splat.h"
 #include "renderer/flyCamera.h"
 #include "renderer/webGPUContext.h"
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
-
-struct GaussianGPU {
-  glm::vec2 meanxy;
-  glm::vec2 meanz_color;
-  float cov3d[6];
-}; // 40bytes
 
 class Renderer {
 public:
