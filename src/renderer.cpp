@@ -168,7 +168,9 @@ preprocessGaussians(const std::vector<GaussianCPU> &cpuGaussians) {
   std::vector<GaussianGPU> gpuGaussians;
   gpuGaussians.reserve(cpuGaussians.size());
 
-  for (const auto &g : cpuGaussians) {
+  for (size_t i = 0; i < cpuGaussians.size(); ++i) {
+    const auto &g = cpuGaussians[i];
+
     GaussianGPU gpu;
     gpu.mean = g.mean;
     gpu.opacity = g.opacity;
@@ -367,14 +369,6 @@ fn vs_main(
     let cam = scene.view * vec4<f32>(g.mean, 1.0);
     let clipPos = scene.proj * cam;
     
-    let clip = 1.2 * clipPos.w;
-    if (clipPos.z < 0.0 || clipPos.z > clipPos.w ||
-        clipPos.x < -clip || clipPos.x > clip ||
-        clipPos.y < -clip || clipPos.y > clip) {
-        return VSOut(vec4<f32>(0.0, 0.0, 2.0, 1.0),
-                     vec4<f32>(0.0),
-                     vec2<f32>(0.0));
-    }
     
     let ndc = clipPos.xy / clipPos.w;
     
@@ -388,13 +382,11 @@ fn vs_main(
     let fx = scene.proj[0][0] * scene.viewport.x * 0.5;
     let fy = scene.proj[1][1] * scene.viewport.y * 0.5;  // Keep positive
     
-    // For RH system, cam.z is negative when in front of camera
-    let z = cam.z;  // Don't negate!
-    let z2 = z * z;
+    let z2 = cam.z * cam.z;
     
     let J = mat3x3<f32>(
-        vec3<f32>( fx / z, 0.0,- (fx * cam.x) / z2 ),
-        vec3<f32>( 0.0, fy / z, -(fy * cam.y) / z2 ),  // Both positive
+        vec3<f32>( fx / cam.z, 0.0,- (fx * cam.x) / z2 ),
+        vec3<f32>( 0.0, fy / cam.z, -(fy * cam.y) / z2 ),  // Both positive
         vec3<f32>( 0.0, 0.0, 0.0 )
     );
     
@@ -451,7 +443,6 @@ let quad = array<vec2<f32>, 4>(
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let A = -dot(in.uv, in.uv);
 
-    
     if (A < -4.0) {
         discard;
     }
@@ -521,8 +512,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   rpDesc.depthStencil = &depthState;
 
   rpDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleStrip;
-  rpDesc.primitive.frontFace = wgpu::FrontFace::CW; // Counter-Clockwise
-  rpDesc.primitive.cullMode = wgpu::CullMode::None; // Hide the back
+  rpDesc.primitive.frontFace = wgpu::FrontFace::CW;
+  rpDesc.primitive.cullMode = wgpu::CullMode::None;
 
   renderPipeline = ctx.device.CreateRenderPipeline(&rpDesc);
 }
@@ -577,16 +568,20 @@ void Renderer::initHistogramPipeline() {
       {// params
        .binding = 2,
        .visibility = wgpu::ShaderStage::Compute,
-       .buffer = {.type = wgpu::BufferBindingType::Uniform}}};
+       .buffer = {.type = wgpu::BufferBindingType::Uniform}},
+      {// drawArgs
+       .binding = 3,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}}};
 
   auto ldesc = wgpu::BindGroupLayoutDescriptor{
-      .entryCount = 3,
+      .entryCount = 4,
       .entries = entries,
   };
 
   auto layout = ctx.device.CreateBindGroupLayout(&ldesc);
 
-  std::array<wgpu::BindGroupEntry, 3> bgEntries = {};
+  std::array<wgpu::BindGroupEntry, 4> bgEntries = {};
   {
     bgEntries[0].binding = 0;
     bgEntries[0].buffer = depthBuffer;
@@ -606,6 +601,13 @@ void Renderer::initHistogramPipeline() {
     bgEntries[2].buffer = histUniformBuffer;
     bgEntries[2].offset = 0;
     bgEntries[2].size = histUniformBuffer.GetSize();
+  }
+
+  {
+    bgEntries[3].binding = 3;
+    bgEntries[3].buffer = indirectBuffer;
+    bgEntries[3].offset = 0;
+    bgEntries[3].size = indirectBuffer.GetSize();
   }
 
   {
@@ -635,9 +637,17 @@ void Renderer::initHistogramPipeline() {
 
   const char *shaderWGSL = R"(
 
+  struct DrawIndirectArgs {
+    vertexCount   : u32,
+    instanceCount : u32,
+    firstVertex   : u32,
+    firstInstance : u32,
+};
+
 @group(0) @binding(0) var<storage, read> keys :  array<u32>;
 @group(0) @binding(1) var<storage, read_write> hist :  array<u32>;
 @group(0) @binding(2) var<uniform> params : vec2<u32>; // (digitOffset, numWorkgroups)
+@group(0) @binding(3) var<storage, read> drawArgs : DrawIndirectArgs;
 
 var<workgroup> localHist : array<atomic<u32>, 256>;
 
@@ -653,7 +663,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   workgroupBarrier();
 
   let idx = gid.x;
-  if (idx < arrayLength(&keys)) {
+  if (idx <  drawArgs.instanceCount) {
     let digit = (keys[idx] >> params.x) & 0xFFu;
     atomicAdd(&localHist[digit], 1u);
   }
@@ -893,16 +903,20 @@ void Renderer::initScatterPipeline() {
       {// params
        .binding = 6,
        .visibility = wgpu::ShaderStage::Compute,
-       .buffer = {.type = wgpu::BufferBindingType::Uniform}}};
+       .buffer = {.type = wgpu::BufferBindingType::Uniform}},
+      {// drawArgs
+       .binding = 7,
+       .visibility = wgpu::ShaderStage::Compute,
+       .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}}};
 
   auto ldesc = wgpu::BindGroupLayoutDescriptor{
-      .entryCount = 7,
+      .entryCount = 8,
       .entries = entries,
   };
 
   auto layout = ctx.device.CreateBindGroupLayout(&ldesc);
 
-  std::array<wgpu::BindGroupEntry, 7> bgEntries = {};
+  std::array<wgpu::BindGroupEntry, 8> bgEntries = {};
   {
     bgEntries[0].binding = 0;
     bgEntries[0].buffer = depthBuffer;
@@ -950,6 +964,13 @@ void Renderer::initScatterPipeline() {
     bgEntries[6].buffer = scatterUniformBuffer;
     bgEntries[6].offset = 0;
     bgEntries[6].size = scatterUniformBuffer.GetSize();
+  }
+
+  {
+    bgEntries[7].binding = 7;
+    bgEntries[7].buffer = indirectBuffer;
+    bgEntries[7].offset = 0;
+    bgEntries[7].size = indirectBuffer.GetSize();
   }
 
   {
@@ -1009,9 +1030,18 @@ void Renderer::initScatterPipeline() {
 @group(0) @binding(4) var<storage, read> globalOff : array<u32>;
 @group(0) @binding(5) var<storage, read> tileOff : array<u32>;
 @group(0) @binding(6) var<uniform> params : vec2<u32>; // (digitOffset, numWorkgroups)
+@group(0) @binding(7) var<storage, read> drawArgs : DrawIndirectArgs;  
+
+struct DrawIndirectArgs {
+    vertexCount   : u32,
+    instanceCount : u32,
+    firstVertex   : u32,
+    firstInstance : u32,
+};
 
 var<workgroup> digit : array<u32, 256>;
 var<workgroup> digitCount : array<atomic<u32>, 256>;
+var<workgroup> prefix : array<u32, 256>; // offset within workgroup
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>,
@@ -1020,22 +1050,25 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
 
 
   let idx = gid.x;
-  let valid = idx < arrayLength(&keys);
+  let valid = idx < drawArgs.instanceCount;
 
-  if (lid.x < 256u) {
-    atomicStore(&digitCount[lid.x], 0u);
-  }
-  workgroupBarrier();
 
   var d : u32 = 0u;
   if (valid) {
     d = (keys[idx] >> params.x) & 0xFFu;
   }
+  digit[lid.x] = d;
+  workgroupBarrier();
 
- 
-  var rank : u32 = 0u;
+
   if (valid) {
-    rank = atomicAdd(&digitCount[d], 1u);
+    var count : u32 = 0u;
+    for (var i : u32 = 0u; i < lid.x; i = i + 1u) {
+      if (digit[i] == d) {
+        count = count + 1u;
+      }
+    }
+    prefix[lid.x] = count;
   }
   workgroupBarrier();
 
@@ -1044,14 +1077,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     let outIndex =
       globalOff[d] +
       tileOff[wid.x * 256u + d] +
-      rank;
+      prefix[lid.x];
 
     outKeys[outIndex] = keys[idx];
     outVals[outIndex] = vals[idx];
   }
 
 }
-
 
 )";
 
@@ -1201,55 +1233,46 @@ struct DrawIndirectArgs {
 @group(0) @binding(3) var<storage, read_write> drawArgs : DrawIndirectArgs;
 @group(0) @binding(4) var<storage, read_write> depths : array<u32>;
 
+
+fn floatToSortableUint(f: f32) -> u32 {
+    let f_bits = bitcast<u32>(f);
+    
+    // If negative: flip all bits (0xFFFFFFFF)
+    // If positive: flip only the sign bit (0x80000000)
+    let mask = select(0x80000000u, 0xFFFFFFFFu, f < 0.0);
+    
+    return f_bits ^ mask;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id : vec3<u32>) {
-
-   
 
     let i = id.x;
     if (i >= arrayLength(&gaussians)) {
         return;
     }
 
-     let g = gaussians[i];
+    let g = gaussians[i];
 
-    // // World → view → clip
     let worldPos = vec4<f32>(g.mean, 1.0);
     let viewPos  = scene.view * worldPos;
+    let clipPos  = scene.proj * viewPos;
 
-    // let clipPos  = scene.proj * viewPos;
 
-    // // Behind camera
-    // if (clipPos.w <= 0.0) {
-    //     return;
-    // }
+    let clip = 1.3 * clipPos.w;
+    if (clipPos.z < 0.0 || clipPos.z > clipPos.w ||
+        clipPos.x < -clip || clipPos.x > clip ||
+        clipPos.y < -clip || clipPos.y > clip) {
+        return ;
+    }
 
-    // let ndc = clipPos.xyz / clipPos.w;
 
-    // // Frustum culling (slightly relaxed)
-    // if (ndc.x < -1.2 || ndc.x > 1.2 ||
-    //     ndc.y < -1.2 || ndc.y > 1.2 ||
-    //     ndc.z <  0.0 || ndc.z > 1.0) {
-    //     return;
-    // }
-
-    // // Screen-size culling (cheap heuristic)
-    // let maxScale = max(g.scale.x, max(g.scale.y, g.scale.z));
-    // let approxRadius = maxScale / clipPos.w;
-
-    // if (approxRadius < 0.5) {
-    //     return;
-    // }
-
-    // Survived → append index
     let writeIndex =atomicAdd(&drawArgs.instanceCount, 1u);
     visibleIndices[writeIndex] = i;
 
     // write depth 
-    let depthBits : u32 = bitcast<u32>(viewPos.z);
-    let sign      : u32 = depthBits & 0x80000000u;
-
-    depths[writeIndex] = select(depthBits ^ 0x80000000u,~depthBits,sign != 0u);
+    let sortableDepth = floatToSortableUint(viewPos.z);
+    depths[writeIndex] = sortableDepth;
 }
 
 )";
@@ -1320,12 +1343,9 @@ void Renderer::render(const FlyCamera &camera, float time) {
   ctx.surface.GetCurrentTexture(&surfaceTexture);
   wgpu::TextureView view = surfaceTexture.texture.CreateView();
 
-  wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
-
   // cull and write depth buffer
   {
     wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
-
     wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
     pass.SetPipeline(cullingPipeline);
     pass.SetBindGroup(0, cullingBindGroup);
@@ -1379,7 +1399,6 @@ void Renderer::render(const FlyCamera &camera, float time) {
       // ------------------------------------------------
 
       wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
-
       encoder.ClearBuffer(histogramBuffer, 0, histogramBuffer.GetSize());
       encoder.ClearBuffer(globalOffsetBuffer, 0, globalOffsetBuffer.GetSize());
       encoder.ClearBuffer(tileOffsetBuffer, 0, tileOffsetBuffer.GetSize());
@@ -1421,6 +1440,7 @@ void Renderer::render(const FlyCamera &camera, float time) {
   }
 
   // render
+  wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
   {
     wgpu::RenderPassColorAttachment colorAttachment{
         .view = view,
@@ -1444,7 +1464,6 @@ void Renderer::render(const FlyCamera &camera, float time) {
     pass.SetPipeline(renderPipeline);
     pass.SetBindGroup(0, renderBindGroup);
     pass.DrawIndirect(indirectBuffer, 0);
-    // pass.Draw(4, gaussianCount);
     pass.End();
   }
 
@@ -1452,6 +1471,7 @@ void Renderer::render(const FlyCamera &camera, float time) {
   // renderGui(encoder, view);
 
   wgpu::CommandBuffer cmd = encoder.Finish();
+
   ctx.queue.Submit(1, &cmd);
 
 #ifndef EMSCRIPTEN
