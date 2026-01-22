@@ -1,6 +1,10 @@
 <video src="https://github.com/39ali/gaussian-splatting/tree/main/doc/output.mp4" width="320" height="240" controls></video>
 
-implemenation of [gaussian splatting paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/), this also implements gpu radix sort for splats sorting in WebGpu for realtime rendering, gaussians are packed to 40bytes since we only need them for rendering and not ML. 
+implemenation of [gaussian splatting paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/), this also implements gpu radix sort for splats sorting in WebGpu for realtime rendering, gaussians are packed to 40bytes since we only need them for rendering and not ML.
+
+you can use the exporter to convert .ply file into packed gpu structs(.splat):
+
+``./build/splat_exporter train_iteration_30000.ply assets/train_iteration_30000.splat``
 
 
 
@@ -13,3 +17,6 @@ you can run it natively by building using cmake or on [web](https://39ali.github
 
 ### controls
 hold shift and use mouse + wasd for movement
+
+
+
